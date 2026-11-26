@@ -1,0 +1,28 @@
+name: Lab approval probe
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  identity:
+    if: github.repository == 'durart/moja-silownia-release-lab'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Record initiator and ref
+        env:
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          ACTOR_ID: ${{ github.actor_id }}
+        run: |
+          printf 'Actor: %s (%s)\nTriggering actor: %s\nRef: %s\nSHA: %s\n' "$ACTOR" "$ACTOR_ID" "$TRIGGERING_ACTOR" "$GITHUB_REF" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+  approval:
+    needs: identity
+    if: github.repository == 'durart/moja-silownia-release-lab'
+    runs-on: ubuntu-24.04
+    environment: lab-production
+    steps:
+      - name: Verify approved synthetic probe
+        run: |
+          test "$GITHUB_REPOSITORY" = durart/moja-silownia-release-lab
+          test "$GITHUB_REF" = refs/heads/main
+          printf 'Approval gate passed; no publication performed.\n' >> "$GITHUB_STEP_SUMMARY"
