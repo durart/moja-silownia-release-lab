@@ -1,0 +1,129 @@
+name: Lab release
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [publish, rollback]
+        required: true
+      expected_main_sha:
+        description: Exact current main SHA (40 hex characters)
+        required: true
+        type: string
+      prior_run:
+        description: Rollback only - successful lab release run ID
+        type: string
+      prior_sha:
+        description: Rollback only - SHA of prior run
+        type: string
+      prior_digest:
+        description: Rollback only - owner-recorded SHA256 of previous index.html
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: release-lab-pages
+  cancel-in-progress: false
+jobs:
+  prepare:
+    if: github.repository == 'durart/moja-silownia-release-lab' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      digest: ${{ steps.evidence.outputs.digest }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+      - name: Validate exact SHA and run tests
+        env:
+          EXPECTED: ${{ inputs.expected_main_sha }}
+          MODE: ${{ inputs.mode }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          export CURRENT="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)"
+          node --input-type=module -e 'import {verifyContext} from "./scripts/verify.mjs"; const e=process.env; verifyContext({repo:e.GITHUB_REPOSITORY,ref:e.GITHUB_REF,runSha:e.GITHUB_SHA,requestedSha:e.EXPECTED,currentSha:e.CURRENT,mode:e.MODE})'
+          node --test tests/*.test.mjs
+      - name: Validate rollback source
+        if: inputs.mode == 'rollback'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRIOR_RUN: ${{ inputs.prior_run }}
+          PRIOR_SHA: ${{ inputs.prior_sha }}
+          PRIOR_DIGEST: ${{ inputs.prior_digest }}
+        run: |
+          [[ "$PRIOR_RUN" =~ ^[1-9][0-9]*$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PRIOR_RUN" > "$RUNNER_TEMP/prior.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PRIOR_RUN/jobs?filter=latest&per_page=100" > "$RUNNER_TEMP/prior-jobs.json"
+          node --input-type=module -e 'import {verifyPrior} from "./scripts/verify.mjs"; import {readFileSync} from "node:fs"; const e=process.env; verifyPrior({runId:e.PRIOR_RUN,sourceSha:e.PRIOR_SHA,expectedDigest:e.PRIOR_DIGEST,priorRun:JSON.parse(readFileSync(e.RUNNER_TEMP+"/prior.json")),priorJobs:JSON.parse(readFileSync(e.RUNNER_TEMP+"/prior-jobs.json")).jobs})'
+      - name: Build synthetic candidate
+        if: inputs.mode == 'publish'
+        run: |
+          mkdir "$RUNNER_TEMP/site"
+          cp site/index.html "$RUNNER_TEMP/site/"
+      - name: Retrieve previous successful lab candidate
+        if: inputs.mode == 'rollback'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: lab-site-${{ inputs.prior_run }}
+          path: ${{ runner.temp }}/site
+          repository: durart/moja-silownia-release-lab
+          run-id: ${{ inputs.prior_run }}
+          github-token: ${{ github.token }}
+      - name: Verify candidate evidence
+        id: evidence
+        env:
+          MODE: ${{ inputs.mode }}
+          PRIOR_DIGEST: ${{ inputs.prior_digest }}
+        run: |
+          DIGEST="$(node scripts/verify.mjs digest "$RUNNER_TEMP/site")"
+          if [ "$MODE" = rollback ]; then
+            node scripts/verify.mjs verify "$RUNNER_TEMP/site" "$PRIOR_DIGEST"
+          else
+            node scripts/verify.mjs verify "$RUNNER_TEMP/site" "$(node scripts/verify.mjs digest site)"
+          fi
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          printf 'Lab mode: %s\n\nSHA: `%s`\n\nContent SHA256: `%s`\n' "$MODE" "$GITHUB_SHA" "$DIGEST" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: lab-site-${{ github.run_id }}
+          path: ${{ runner.temp }}/site/index.html
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa
+        with:
+          path: ${{ runner.temp }}/site
+  deploy:
+    needs: prepare
+    if: github.repository == 'durart/moja-silownia-release-lab' && github.ref == 'refs/heads/main' && vars.LAB_RELEASE_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    steps:
+      - name: Reject stale run after owner review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED: ${{ inputs.expected_main_sha }}
+        run: |
+          test "$GITHUB_REPOSITORY" = 'durart/moja-silownia-release-lab'
+          test "$GITHUB_REF" = 'refs/heads/main'
+          test "$EXPECTED" = "$GITHUB_SHA"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)" = "$EXPECTED"
+      - id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e
+      - env:
+          DIGEST: ${{ needs.prepare.outputs.digest }}
+        run: |
+          printf 'Approved lab content SHA256: `%s`\n' "$DIGEST" >> "$GITHUB_STEP_SUMMARY"
